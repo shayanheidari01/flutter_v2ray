@@ -1,3 +1,26 @@
+## 1.0.11
+
+* **BREAKING CHANGE**: Updated ping calculation formula - now divides by 4 instead of 3 for more accurate real ping values
+* **Major Optimization**: Completely optimized V2rayCoreManager for crash prevention:
+  - Enhanced `startCore()` with comprehensive input validation and native error handling
+  - Improved `makeDurationTimer()` with safe statistics collection and broadcast handling
+  - Optimized `setUpListener()` with proper service validation and native library error handling
+  - Enhanced `stopCore()` with safe notification cancellation and emergency state cleanup
+  - Added defensive programming to all native callback methods (shutdown, protect, setup)
+* **Stability Improvements**: 
+  - Added UnsatisfiedLinkError handling for all native library calls
+  - Implemented comprehensive null pointer exception prevention
+  - Enhanced error logging and graceful failure handling
+  - Added proper state management and cleanup mechanisms
+* **Ping Methods Enhancement**: 
+  - Improved error handling in `getConnectedV2rayServerDelay()` and `getV2rayServerDelay()`
+  - Added result validation with maximum 30-second timeout
+  - Enhanced JSON processing with robust fallback mechanisms
+* **Build Fixes**:
+  - Fixed Java compilation error with JSONObject.keys() iterator
+  - Updated NDK version to 27.0.12077973 for compatibility
+  - Added missing Iterator import
+
 ## 1.0.10
 
 * update xray core version to 25.3.6

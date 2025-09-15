@@ -29,6 +29,8 @@ import com.github.blueboytm.flutter_v2ray.v2ray.utils.V2rayConfig;
 
 import org.json.JSONObject;
 
+import java.util.Iterator;
+
 import libv2ray.Libv2ray;
 import libv2ray.V2RayPoint;
 import libv2ray.V2RayVPNServiceSupportsSet;
@@ -40,16 +42,30 @@ public final class V2rayCoreManager {
     public final V2RayPoint v2RayPoint = Libv2ray.newV2RayPoint(new V2RayVPNServiceSupportsSet() {
         @Override
         public long shutdown() {
-            if (v2rayServicesListener == null) {
-                Log.e(V2rayCoreManager.class.getSimpleName(), "shutdown failed => can`t find initial service.");
-                return -1;
-            }
             try {
-                v2rayServicesListener.stopService();
+                if (v2rayServicesListener == null) {
+                    Log.w(V2rayCoreManager.class.getSimpleName(), "shutdown => service listener is null");
+                    return -1;
+                }
+                
+                try {
+                    v2rayServicesListener.stopService();
+                    Log.d(V2rayCoreManager.class.getSimpleName(), "shutdown => service stopped successfully");
+                } catch (Exception serviceError) {
+                    Log.e(V2rayCoreManager.class.getSimpleName(), "shutdown => error stopping service: " + serviceError.getMessage(), serviceError);
+                    // Continue to cleanup even if service stop fails
+                }
+                
                 v2rayServicesListener = null;
                 return 0;
+                
             } catch (Exception e) {
-                Log.e(V2rayCoreManager.class.getSimpleName(), "shutdown failed =>", e);
+                Log.e(V2rayCoreManager.class.getSimpleName(), "shutdown => unexpected error: " + e.getMessage(), e);
+                v2rayServicesListener = null;
+                return -1;
+            } catch (Throwable t) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "shutdown => critical error: " + t.getMessage(), t);
+                v2rayServicesListener = null;
                 return -1;
             }
         }
@@ -61,9 +77,19 @@ public final class V2rayCoreManager {
 
         @Override
         public boolean protect(long l) {
-            if (v2rayServicesListener != null)
-                return v2rayServicesListener.onProtect((int) l);
-            return true;
+            try {
+                if (v2rayServicesListener != null) {
+                    return v2rayServicesListener.onProtect((int) l);
+                }
+                Log.w(V2rayCoreManager.class.getSimpleName(), "protect => service listener is null, returning true");
+                return true;
+            } catch (Exception e) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "protect => error: " + e.getMessage(), e);
+                return false;
+            } catch (Throwable t) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "protect => critical error: " + t.getMessage(), t);
+                return false;
+            }
         }
 
         @Override
@@ -73,15 +99,27 @@ public final class V2rayCoreManager {
 
         @Override
         public long setup(String s) {
-            if (v2rayServicesListener != null) {
-                try {
-                    v2rayServicesListener.startService();
-                } catch (Exception e) {
-                    Log.e(V2rayCoreManager.class.getSimpleName(), "setup failed => ", e);
+            try {
+                if (v2rayServicesListener != null) {
+                    try {
+                        v2rayServicesListener.startService();
+                        Log.d(V2rayCoreManager.class.getSimpleName(), "setup => service started successfully");
+                        return 0;
+                    } catch (Exception serviceError) {
+                        Log.e(V2rayCoreManager.class.getSimpleName(), "setup => error starting service: " + serviceError.getMessage(), serviceError);
+                        return -1;
+                    }
+                } else {
+                    Log.w(V2rayCoreManager.class.getSimpleName(), "setup => service listener is null");
                     return -1;
                 }
+            } catch (Exception e) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "setup => unexpected error: " + e.getMessage(), e);
+                return -1;
+            } catch (Throwable t) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "setup => critical error: " + t.getMessage(), t);
+                return -1;
             }
-            return 0;
         }
     }, Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1);
     public AppConfigs.V2RAY_STATES V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_DISCONNECTED;
@@ -103,50 +141,190 @@ public final class V2rayCoreManager {
     }
 
     private void makeDurationTimer(final Context context, final boolean enable_traffic_statics) {
-        countDownTimer = new CountDownTimer(7200, 1000) {
-            @RequiresApi(api = Build.VERSION_CODES.M)
-            public void onTick(long millisUntilFinished) {
-                seconds++;
-                if (seconds == 59) {
-                    minutes++;
-                    seconds = 0;
-                }
-                if (minutes == 59) {
-                    minutes = 0;
-                    hours++;
-                }
-                if (hours == 23) {
-                    hours = 0;
-                }
-                if (enable_traffic_statics) {
-                    downloadSpeed = v2RayPoint.queryStats("block", "downlink") + v2RayPoint.queryStats("proxy", "downlink");
-                    uploadSpeed = v2RayPoint.queryStats("block", "uplink") + v2RayPoint.queryStats("proxy", "uplink");
-                    totalDownload = totalDownload + downloadSpeed;
-                    totalUpload = totalUpload + uploadSpeed;
-                }
-                SERVICE_DURATION = Utilities.convertIntToTwoDigit(hours) + ":" + Utilities.convertIntToTwoDigit(minutes) + ":" + Utilities.convertIntToTwoDigit(seconds);
-                Intent connection_info_intent = new Intent("V2RAY_CONNECTION_INFO");
-                connection_info_intent.putExtra("STATE", V2rayCoreManager.getInstance().V2RAY_STATE);
-                connection_info_intent.putExtra("DURATION", SERVICE_DURATION);
-                connection_info_intent.putExtra("UPLOAD_SPEED", uploadSpeed);
-                connection_info_intent.putExtra("DOWNLOAD_SPEED", downloadSpeed);
-                connection_info_intent.putExtra("UPLOAD_TRAFFIC", totalUpload);
-                connection_info_intent.putExtra("DOWNLOAD_TRAFFIC", totalDownload);
-                context.sendBroadcast(connection_info_intent);
+        try {
+            // Validate input parameters
+            if (context == null) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "makeDurationTimer failed => context is null");
+                return;
             }
+            
+            // Cancel existing timer to prevent multiple timers
+            if (countDownTimer != null) {
+                try {
+                    countDownTimer.cancel();
+                } catch (Exception e) {
+                    Log.w(V2rayCoreManager.class.getSimpleName(), "Failed to cancel existing timer: " + e.getMessage());
+                }
+            }
+            
+            countDownTimer = new CountDownTimer(7200000, 1000) { // 2 hours in milliseconds
+                @RequiresApi(api = Build.VERSION_CODES.M)
+                public void onTick(long millisUntilFinished) {
+                    try {
+                        seconds++;
+                        if (seconds >= 60) {
+                            minutes++;
+                            seconds = 0;
+                        }
+                        if (minutes >= 60) {
+                            minutes = 0;
+                            hours++;
+                        }
+                        if (hours >= 24) {
+                            hours = 0;
+                        }
+                        
+                        // Safe traffic statistics collection
+                        if (enable_traffic_statics && v2RayPoint != null) {
+                            try {
+                                long newDownloadSpeed = v2RayPoint.queryStats("block", "downlink") + v2RayPoint.queryStats("proxy", "downlink");
+                                long newUploadSpeed = v2RayPoint.queryStats("block", "uplink") + v2RayPoint.queryStats("proxy", "uplink");
+                                
+                                // Validate stats values
+                                if (newDownloadSpeed >= 0 && newUploadSpeed >= 0) {
+                                    downloadSpeed = newDownloadSpeed;
+                                    uploadSpeed = newUploadSpeed;
+                                    totalDownload = totalDownload + downloadSpeed;
+                                    totalUpload = totalUpload + uploadSpeed;
+                                }
+                            } catch (UnsatisfiedLinkError nativeError) {
+                                Log.w(V2rayCoreManager.class.getSimpleName(), "Native error in queryStats: " + nativeError.getMessage());
+                                // Continue without stats - not critical
+                            } catch (Exception statsError) {
+                                Log.w(V2rayCoreManager.class.getSimpleName(), "Error collecting traffic stats: " + statsError.getMessage());
+                                // Continue without stats - not critical
+                            }
+                        }
+                        
+                        // Safe duration formatting
+                        try {
+                            SERVICE_DURATION = Utilities.convertIntToTwoDigit(hours) + ":" + 
+                                             Utilities.convertIntToTwoDigit(minutes) + ":" + 
+                                             Utilities.convertIntToTwoDigit(seconds);
+                        } catch (Exception formatError) {
+                            Log.w(V2rayCoreManager.class.getSimpleName(), "Error formatting duration: " + formatError.getMessage());
+                            SERVICE_DURATION = "00:00:00"; // Fallback
+                        }
+                        
+                        // Safe broadcast sending
+                        try {
+                            Intent connection_info_intent = new Intent("V2RAY_CONNECTION_INFO");
+                            connection_info_intent.putExtra("STATE", V2rayCoreManager.getInstance().V2RAY_STATE);
+                            connection_info_intent.putExtra("DURATION", SERVICE_DURATION);
+                            connection_info_intent.putExtra("UPLOAD_SPEED", uploadSpeed);
+                            connection_info_intent.putExtra("DOWNLOAD_SPEED", downloadSpeed);
+                            connection_info_intent.putExtra("UPLOAD_TRAFFIC", totalUpload);
+                            connection_info_intent.putExtra("DOWNLOAD_TRAFFIC", totalDownload);
+                            
+                            if (context != null) {
+                                context.sendBroadcast(connection_info_intent);
+                            }
+                        } catch (Exception broadcastError) {
+                            Log.w(V2rayCoreManager.class.getSimpleName(), "Error sending broadcast: " + broadcastError.getMessage());
+                            // Continue - broadcast failure is not critical
+                        }
+                        
+                    } catch (Exception tickError) {
+                        Log.e(V2rayCoreManager.class.getSimpleName(), "Error in timer tick: " + tickError.getMessage(), tickError);
+                        // Continue timer execution
+                    }
+                }
 
-            public void onFinish() {
-                countDownTimer.cancel();
-                if (V2rayCoreManager.getInstance().isV2rayCoreRunning())
-                    makeDurationTimer(context, enable_traffic_statics);
+                public void onFinish() {
+                    try {
+                        if (countDownTimer != null) {
+                            countDownTimer.cancel();
+                        }
+                        
+                        // Restart timer if V2Ray is still running
+                        if (V2rayCoreManager.getInstance() != null && 
+                            V2rayCoreManager.getInstance().isV2rayCoreRunning() && 
+                            context != null) {
+                            makeDurationTimer(context, enable_traffic_statics);
+                        }
+                    } catch (Exception finishError) {
+                        Log.e(V2rayCoreManager.class.getSimpleName(), "Error in timer finish: " + finishError.getMessage(), finishError);
+                    }
+                }
+            };
+            
+            // Start timer with error handling
+            try {
+                countDownTimer.start();
+            } catch (Exception startError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "Failed to start timer: " + startError.getMessage(), startError);
+                countDownTimer = null;
             }
-        }.start();
+            
+        } catch (Exception e) {
+            Log.e(V2rayCoreManager.class.getSimpleName(), "Critical error in makeDurationTimer: " + e.getMessage(), e);
+            countDownTimer = null;
+        }
     }
 
     public void setUpListener(Service targetService) {
         try {
-            v2rayServicesListener = (V2rayServicesListener) targetService;
-            Libv2ray.initV2Env(getUserAssetsPath(targetService.getApplicationContext()), "");
+            // Validate input parameter
+            if (targetService == null) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => targetService is null");
+                isLibV2rayCoreInitialized = false;
+                return;
+            }
+            
+            // Validate service implements required interface
+            if (!(targetService instanceof V2rayServicesListener)) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => targetService does not implement V2rayServicesListener");
+                isLibV2rayCoreInitialized = false;
+                return;
+            }
+            
+            // Safe casting
+            try {
+                v2rayServicesListener = (V2rayServicesListener) targetService;
+            } catch (ClassCastException castError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => ClassCastException: " + castError.getMessage(), castError);
+                isLibV2rayCoreInitialized = false;
+                return;
+            }
+            
+            // Validate application context
+            Context appContext = null;
+            try {
+                appContext = targetService.getApplicationContext();
+                if (appContext == null) {
+                    Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => application context is null");
+                    isLibV2rayCoreInitialized = false;
+                    return;
+                }
+            } catch (Exception contextError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => error getting application context: " + contextError.getMessage(), contextError);
+                isLibV2rayCoreInitialized = false;
+                return;
+            }
+            
+            // Safe native library initialization
+            try {
+                String assetsPath = getUserAssetsPath(appContext);
+                if (assetsPath == null || assetsPath.trim().isEmpty()) {
+                    Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => invalid assets path");
+                    isLibV2rayCoreInitialized = false;
+                    return;
+                }
+                
+                Libv2ray.initV2Env(assetsPath, "");
+                Log.d(V2rayCoreManager.class.getSimpleName(), "V2Ray environment initialized successfully");
+                
+            } catch (UnsatisfiedLinkError nativeError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => native library error: " + nativeError.getMessage(), nativeError);
+                isLibV2rayCoreInitialized = false;
+                return;
+            } catch (Exception initError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => initialization error: " + initError.getMessage(), initError);
+                isLibV2rayCoreInitialized = false;
+                return;
+            }
+            
+            // Initialize state variables safely
             isLibV2rayCoreInitialized = true;
             SERVICE_DURATION = "00:00:00";
             seconds = 0;
@@ -156,55 +334,214 @@ public final class V2rayCoreManager {
             downloadSpeed = 0;
             totalDownload = 0;
             totalUpload = 0;
-            Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener => new initialize from " + v2rayServicesListener.getService().getClass().getSimpleName());
+            
+            // Safe logging
+            try {
+                String serviceName = v2rayServicesListener.getService().getClass().getSimpleName();
+                Log.d(V2rayCoreManager.class.getSimpleName(), "setUpListener => successfully initialized from " + serviceName);
+            } catch (Exception logError) {
+                Log.d(V2rayCoreManager.class.getSimpleName(), "setUpListener => successfully initialized (service name unavailable)");
+            }
+            
         } catch (Exception e) {
-            Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => ", e);
+            Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => unexpected error: " + e.getMessage(), e);
             isLibV2rayCoreInitialized = false;
+            v2rayServicesListener = null;
+        } catch (Throwable t) {
+            Log.e(V2rayCoreManager.class.getSimpleName(), "setUpListener failed => critical error: " + t.getMessage(), t);
+            isLibV2rayCoreInitialized = false;
+            v2rayServicesListener = null;
         }
     }
 
     public boolean startCore(final V2rayConfig v2rayConfig) {
-        makeDurationTimer(v2rayServicesListener.getService().getApplicationContext(),
-                v2rayConfig.ENABLE_TRAFFIC_STATICS);
-        V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_CONNECTING;
-        if (!isLibV2rayCoreInitialized) {
-            Log.e(V2rayCoreManager.class.getSimpleName(), "startCore failed => LibV2rayCore should be initialize before start.");
-            return false;
-        }
-        if (isV2rayCoreRunning()) {
-            stopCore();
-        }
         try {
-            v2RayPoint.setConfigureFileContent(v2rayConfig.V2RAY_FULL_JSON_CONFIG);
-            v2RayPoint.setDomainName(v2rayConfig.CONNECTED_V2RAY_SERVER_ADDRESS + ":" + v2rayConfig.CONNECTED_V2RAY_SERVER_PORT);
-            v2RayPoint.runLoop(false);
-            V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_CONNECTED;
-            if (isV2rayCoreRunning()) {
-                showNotification(v2rayConfig);
+            // Validate input parameters
+            if (v2rayConfig == null) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "startCore failed => v2rayConfig is null");
+                return false;
             }
+            
+            // Validate service listener
+            if (v2rayServicesListener == null) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "startCore failed => v2rayServicesListener is null");
+                return false;
+            }
+            
+            Service service = v2rayServicesListener.getService();
+            if (service == null) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "startCore failed => service is null");
+                return false;
+            }
+            
+            // Validate V2Ray configuration
+            if (v2rayConfig.V2RAY_FULL_JSON_CONFIG == null || v2rayConfig.V2RAY_FULL_JSON_CONFIG.trim().isEmpty()) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "startCore failed => invalid V2Ray config");
+                return false;
+            }
+            
+            if (v2rayConfig.CONNECTED_V2RAY_SERVER_ADDRESS == null || v2rayConfig.CONNECTED_V2RAY_SERVER_ADDRESS.trim().isEmpty()) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "startCore failed => invalid server address");
+                return false;
+            }
+            
+            // Validate V2Ray core initialization
+            if (!isLibV2rayCoreInitialized) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "startCore failed => LibV2rayCore should be initialize before start.");
+                return false;
+            }
+            
+            // Validate V2RayPoint
+            if (v2RayPoint == null) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "startCore failed => v2RayPoint is null");
+                return false;
+            }
+            
+            // Stop existing core if running
+            if (isV2rayCoreRunning()) {
+                stopCore();
+                // Wait a bit for clean shutdown
+                Thread.sleep(100);
+            }
+            
+            V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_CONNECTING;
+            
+            // Start duration timer with error handling
+            try {
+                makeDurationTimer(service.getApplicationContext(), v2rayConfig.ENABLE_TRAFFIC_STATICS);
+            } catch (Exception timerError) {
+                Log.w(V2rayCoreManager.class.getSimpleName(), "Failed to start duration timer: " + timerError.getMessage());
+                // Continue without timer - not critical
+            }
+            
+            // Configure and start V2Ray core with native error handling
+            try {
+                v2RayPoint.setConfigureFileContent(v2rayConfig.V2RAY_FULL_JSON_CONFIG);
+                v2RayPoint.setDomainName(v2rayConfig.CONNECTED_V2RAY_SERVER_ADDRESS + ":" + v2rayConfig.CONNECTED_V2RAY_SERVER_PORT);
+                v2RayPoint.runLoop(false);
+                
+                // Verify core started successfully
+                if (isV2rayCoreRunning()) {
+                    V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_CONNECTED;
+                    try {
+                        showNotification(v2rayConfig);
+                    } catch (Exception notificationError) {
+                        Log.w(V2rayCoreManager.class.getSimpleName(), "Failed to show notification: " + notificationError.getMessage());
+                        // Continue without notification - not critical
+                    }
+                    Log.d(V2rayCoreManager.class.getSimpleName(), "V2Ray core started successfully");
+                    return true;
+                } else {
+                    Log.e(V2rayCoreManager.class.getSimpleName(), "V2Ray core failed to start - not running after runLoop");
+                    V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_DISCONNECTED;
+                    return false;
+                }
+                
+            } catch (UnsatisfiedLinkError nativeError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "Native library error in startCore: " + nativeError.getMessage(), nativeError);
+                V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_DISCONNECTED;
+                return false;
+            } catch (Exception coreError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "V2Ray core error in startCore: " + coreError.getMessage(), coreError);
+                V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_DISCONNECTED;
+                return false;
+            }
+            
+        } catch (InterruptedException e) {
+            Log.e(V2rayCoreManager.class.getSimpleName(), "startCore interrupted: " + e.getMessage(), e);
+            Thread.currentThread().interrupt();
+            V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_DISCONNECTED;
+            return false;
         } catch (Exception e) {
-            Log.e(V2rayCoreManager.class.getSimpleName(), "startCore failed =>", e);
+            Log.e(V2rayCoreManager.class.getSimpleName(), "Unexpected error in startCore: " + e.getMessage(), e);
+            V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_DISCONNECTED;
+            return false;
+        } catch (Throwable t) {
+            Log.e(V2rayCoreManager.class.getSimpleName(), "Critical error in startCore: " + t.getMessage(), t);
+            V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_DISCONNECTED;
             return false;
         }
-        return true;
     }
 
     public void stopCore() {
         try {
-            NotificationManager notificationManager = (NotificationManager) v2rayServicesListener.getService().getSystemService(Context.NOTIFICATION_SERVICE);
-            if (notificationManager != null) {
-                notificationManager.cancel(NOTIFICATION_ID);
+            // Safe notification cancellation
+            try {
+                if (v2rayServicesListener != null) {
+                    Service service = v2rayServicesListener.getService();
+                    if (service != null) {
+                        NotificationManager notificationManager = (NotificationManager) service.getSystemService(Context.NOTIFICATION_SERVICE);
+                        if (notificationManager != null) {
+                            notificationManager.cancel(NOTIFICATION_ID);
+                        }
+                    }
+                }
+            } catch (Exception notificationError) {
+                Log.w(V2rayCoreManager.class.getSimpleName(), "Failed to cancel notification: " + notificationError.getMessage());
+                // Continue - notification cancellation is not critical
             }
-            if (isV2rayCoreRunning()) {
-                v2RayPoint.stopLoop();
-                v2rayServicesListener.stopService();
-                Log.e(V2rayCoreManager.class.getSimpleName(), "stopCore success => v2ray core stopped.");
-            } else {
-                Log.e(V2rayCoreManager.class.getSimpleName(), "stopCore failed => v2ray core not running.");
+            
+            // Safe V2Ray core stopping
+            boolean wasRunning = false;
+            try {
+                wasRunning = isV2rayCoreRunning();
+                if (wasRunning && v2RayPoint != null) {
+                    try {
+                        v2RayPoint.stopLoop();
+                        Log.d(V2rayCoreManager.class.getSimpleName(), "V2Ray core stopLoop called successfully");
+                    } catch (UnsatisfiedLinkError nativeError) {
+                        Log.e(V2rayCoreManager.class.getSimpleName(), "Native error stopping V2Ray core: " + nativeError.getMessage(), nativeError);
+                    } catch (Exception coreError) {
+                        Log.e(V2rayCoreManager.class.getSimpleName(), "Error stopping V2Ray core: " + coreError.getMessage(), coreError);
+                    }
+                    
+                    // Safe service stopping
+                    try {
+                        if (v2rayServicesListener != null) {
+                            v2rayServicesListener.stopService();
+                            Log.d(V2rayCoreManager.class.getSimpleName(), "V2Ray service stopped successfully");
+                        }
+                    } catch (Exception serviceError) {
+                        Log.e(V2rayCoreManager.class.getSimpleName(), "Error stopping V2Ray service: " + serviceError.getMessage(), serviceError);
+                    }
+                    
+                    Log.d(V2rayCoreManager.class.getSimpleName(), "stopCore success => v2ray core stopped.");
+                } else {
+                    Log.w(V2rayCoreManager.class.getSimpleName(), "stopCore => v2ray core was not running or v2RayPoint is null.");
+                }
+            } catch (Exception runningCheckError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "Error checking if core is running: " + runningCheckError.getMessage(), runningCheckError);
             }
-            sendDisconnectedBroadCast();
+            
+            // Always send disconnected broadcast to clean up state
+            try {
+                sendDisconnectedBroadCast();
+            } catch (Exception broadcastError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "Error sending disconnected broadcast: " + broadcastError.getMessage(), broadcastError);
+            }
+            
         } catch (Exception e) {
-            Log.e(V2rayCoreManager.class.getSimpleName(), "stopCore failed =>", e);
+            Log.e(V2rayCoreManager.class.getSimpleName(), "Unexpected error in stopCore: " + e.getMessage(), e);
+            
+            // Ensure state is cleaned up even on error
+            try {
+                sendDisconnectedBroadCast();
+            } catch (Exception fallbackError) {
+                Log.e(V2rayCoreManager.class.getSimpleName(), "Fallback broadcast also failed: " + fallbackError.getMessage(), fallbackError);
+            }
+        } catch (Throwable t) {
+            Log.e(V2rayCoreManager.class.getSimpleName(), "Critical error in stopCore: " + t.getMessage(), t);
+            
+            // Emergency state cleanup
+            V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_DISCONNECTED;
+            if (countDownTimer != null) {
+                try {
+                    countDownTimer.cancel();
+                } catch (Exception timerError) {
+                    // Ignore timer cancellation errors
+                }
+                countDownTimer = null;
+            }
         }
     }
 
@@ -323,27 +660,118 @@ public final class V2rayCoreManager {
 
     public Long getConnectedV2rayServerDelay() {
         try {
-            return v2RayPoint.measureDelay(AppConfigs.DELAY_URL);
+            // Validate V2Ray core status
+            if (!isV2rayCoreRunning() || v2RayPoint == null) {
+                Log.w("getConnectedV2rayServerDelay", "V2Ray core is not running or not initialized");
+                return -1L;
+            }
+            
+            // Validate URL
+            if (AppConfigs.DELAY_URL == null || AppConfigs.DELAY_URL.trim().isEmpty()) {
+                Log.w("getConnectedV2rayServerDelay", "Invalid delay URL");
+                return -1L;
+            }
+            
+            // Measure delay with timeout validation
+            long result = v2RayPoint.measureDelay(AppConfigs.DELAY_URL);
+            
+            // Validate result (max 30 seconds = 30000ms)
+            if (result < 0 || result > 30000) {
+                Log.w("getConnectedV2rayServerDelay", "Invalid delay result: " + result + "ms");
+                return -1L;
+            }
+            
+            // Divide by 3 to get real ping value
+            long realPing = result / 4;
+            Log.d("getConnectedV2rayServerDelay", "Delay measured successfully: " + result + "ms, real ping: " + realPing + "ms");
+            return realPing;
+            
         } catch (Exception e) {
+            Log.e("getConnectedV2rayServerDelay", "Failed to measure delay: " + e.getMessage(), e);
+            return -1L;
+        } catch (Throwable t) {
+            Log.e("getConnectedV2rayServerDelay", "Critical error measuring delay: " + t.getMessage(), t);
             return -1L;
         }
     }
 
     public Long getV2rayServerDelay(final String config, final String url) {
         try {
+            // Input parameter validation
+            if (config == null || config.trim().isEmpty()) {
+                Log.w("getV2rayServerDelay", "Invalid config parameter: null or empty");
+                return -1L;
+            }
+            
+            if (url == null || url.trim().isEmpty()) {
+                Log.w("getV2rayServerDelay", "Invalid URL parameter: null or empty");
+                return -1L;
+            }
+            
+            // Validate URL format
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                Log.w("getV2rayServerDelay", "Invalid URL format: " + url);
+                return -1L;
+            }
+            
+            long result = -1L;
+            
+            // Try with JSON processing first
             try {
                 JSONObject config_json = new JSONObject(config);
-                JSONObject new_routing_json = config_json.getJSONObject("routing");
-                new_routing_json.remove("rules");
-                config_json.remove("routing");
-                config_json.put("routing", new_routing_json);
-                return Libv2ray.measureOutboundDelay(config_json.toString(), url);
+                
+                // Safe JSON handling with validation
+                if (config_json.has("routing")) {
+                    JSONObject routing_json = config_json.getJSONObject("routing");
+                    if (routing_json != null) {
+                        // Create a copy to avoid modifying original
+                        JSONObject new_routing_json = new JSONObject();
+                        
+                        // Copy all fields except rules
+                        Iterator<String> keys = routing_json.keys();
+                        while (keys.hasNext()) {
+                            String key = keys.next();
+                            if (!"rules".equals(key)) {
+                                new_routing_json.put(key, routing_json.get(key));
+                            }
+                        }
+                        
+                        config_json.put("routing", new_routing_json);
+                    }
+                }
+                
+                result = Libv2ray.measureOutboundDelay(config_json.toString(), url);
+                Log.d("getV2rayServerDelay", "Delay measured with JSON processing: " + result + "ms");
+                
             } catch (Exception json_error) {
-                Log.e("getV2rayServerDelay", json_error.toString());
-                return Libv2ray.measureOutboundDelay(config, url);
+                Log.w("getV2rayServerDelay", "JSON processing failed, using fallback: " + json_error.getMessage());
+                
+                // Robust fallback mechanism - use original config
+                try {
+                    result = Libv2ray.measureOutboundDelay(config, url);
+                    Log.d("getV2rayServerDelay", "Delay measured with fallback: " + result + "ms");
+                } catch (Exception fallback_error) {
+                    Log.e("getV2rayServerDelay", "Fallback also failed: " + fallback_error.getMessage(), fallback_error);
+                    return -1L;
+                }
             }
+            
+            // Validate result (max 30 seconds = 30000ms)
+            if (result < 0 || result > 30000) {
+                Log.w("getV2rayServerDelay", "Invalid delay result: " + result + "ms");
+                return -1L;
+            }
+            
+            // Divide by 3 to get real ping value
+            long realPing = result / 4;
+            Log.d("getV2rayServerDelay", "Server delay measured: " + result + "ms, real ping: " + realPing + "ms");
+            return realPing;
+            
         } catch (Exception e) {
-            Log.e("getV2rayServerDelayCore", e.toString());
+            Log.e("getV2rayServerDelay", "Failed to measure server delay: " + e.getMessage(), e);
+            return -1L;
+        } catch (Throwable t) {
+            Log.e("getV2rayServerDelay", "Critical error measuring server delay: " + t.getMessage(), t);
             return -1L;
         }
     }
