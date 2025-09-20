@@ -93,26 +93,48 @@ public class V2rayController {
             return -1;
         }
         final long[] delay = {-1};
-
         final CountDownLatch latch = new CountDownLatch(1);
-        check_delay.putExtra("COMMAND", AppConfigs.V2RAY_SERVICE_COMMANDS.MEASURE_DELAY);
-        context.startService(check_delay);
+
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context arg0, Intent arg1) {
-                String delayString = arg1.getExtras().getString("DELAY");
-                delay[0] = Long.parseLong(delayString);
-                context.unregisterReceiver(this);
-                latch.countDown();
+                try {
+                    if (arg1 != null && arg1.getExtras() != null) {
+                        String delayString = arg1.getExtras().getString("DELAY");
+                        if (delayString != null) {
+                            delay[0] = Long.parseLong(delayString);
+                        } else {
+                            delay[0] = -1;
+                        }
+                    } else {
+                        delay[0] = -1;
+                    }
+                } catch (Exception e) {
+                    delay[0] = -1;
+                } finally {
+                    latch.countDown();
+                }
             }
         };
 
+        // Register the receiver BEFORE triggering the service to avoid race conditions
+        boolean registered = false;
         IntentFilter delayIntentFilter = new IntentFilter("CONNECTED_V2RAY_SERVER_DELAY");
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.registerReceiver(receiver, delayIntentFilter, Context.RECEIVER_EXPORTED);
-        }else{
-            context.registerReceiver(receiver, delayIntentFilter);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(receiver, delayIntentFilter, Context.RECEIVER_EXPORTED);
+            } else {
+                context.registerReceiver(receiver, delayIntentFilter);
+            }
+            registered = true;
+        } catch (Exception e) {
+            // If receiver cannot be registered, we can't wait for the broadcast
+            return -1;
         }
+
+        // Now trigger the measurement
+        check_delay.putExtra("COMMAND", AppConfigs.V2RAY_SERVICE_COMMANDS.MEASURE_DELAY);
+        context.startService(check_delay);
 
         try {
             boolean received = latch.await(3000, TimeUnit.MILLISECONDS);
@@ -120,7 +142,15 @@ public class V2rayController {
                 return -1;
             }
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            Thread.currentThread().interrupt();
+            return -1;
+        } finally {
+            if (registered) {
+                try {
+                    context.unregisterReceiver(receiver);
+                } catch (Exception ignored) {
+                }
+            }
         }
         return delay[0];
     }
