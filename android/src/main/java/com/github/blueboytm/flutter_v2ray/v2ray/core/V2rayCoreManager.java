@@ -135,8 +135,12 @@ public final class V2rayCoreManager {
     private long lastDelayCallAt = 0L;
     private long delayCooldownUntil = 0L;
     private int consecutiveDelayErrors = 0;
-    private static final long MIN_DELAY_INTERVAL_MS = 50L;
-    private static final long ERROR_COOLDOWN_MS = 2000L;
+    private static final long MIN_DELAY_INTERVAL_MS = 120L;
+    private static final long ERROR_COOLDOWN_MS = 3000L;
+    private long circuitBreakerUntil = 0L;
+    private int errorWindowCount = 0;
+    private static final int ERROR_WINDOW_THRESHOLD = 5;
+    private static final long CIRCUIT_BREAKER_MS = 10000L;
 
     public static V2rayCoreManager getInstance() {
         if (INSTANCE == null) {
@@ -671,213 +675,111 @@ public final class V2rayCoreManager {
         try {
             synchronized (delayLock) {
                 final long now = SystemClock.elapsedRealtime();
-                if (now - lastDelayCallAt < MIN_DELAY_INTERVAL_MS) {
-                    return -1L; // too soon; skip to avoid tight loops
-                }
-                if (now < delayCooldownUntil) {
-                    return -1L; // in cooldown after recent native errors
-                }
+                if (now - lastDelayCallAt < MIN_DELAY_INTERVAL_MS) return -1L;
+                if (now < delayCooldownUntil) return -1L;
+                if (now < circuitBreakerUntil) return -1L;
 
-                // Validate connection state and config
-                if (V2RAY_STATE != AppConfigs.V2RAY_STATES.V2RAY_CONNECTED) {
-                    Log.w("getConnectedV2rayServerDelay", "V2Ray is not connected");
-                    return -1L;
-                }
-
+                if (V2RAY_STATE != AppConfigs.V2RAY_STATES.V2RAY_CONNECTED) return -1L;
                 if (AppConfigs.V2RAY_CONFIG == null ||
                         AppConfigs.V2RAY_CONFIG.V2RAY_FULL_JSON_CONFIG == null ||
-                        AppConfigs.V2RAY_CONFIG.V2RAY_FULL_JSON_CONFIG.trim().isEmpty()) {
-                    Log.w("getConnectedV2rayServerDelay", "Missing or invalid V2Ray config for measurement");
-                    return -1L;
-                }
+                        AppConfigs.V2RAY_CONFIG.V2RAY_FULL_JSON_CONFIG.trim().isEmpty()) return -1L;
 
-                // Validate URL
-                if (AppConfigs.DELAY_URL == null || AppConfigs.DELAY_URL.trim().isEmpty()) {
-                    Log.w("getConnectedV2rayServerDelay", "Invalid delay URL");
-                    return -1L;
-                }
-                if (!AppConfigs.DELAY_URL.startsWith("http://") && !AppConfigs.DELAY_URL.startsWith("https://")) {
-                    Log.w("getConnectedV2rayServerDelay", "Invalid delay URL format: " + AppConfigs.DELAY_URL);
-                    return -1L;
-                }
+                String url = AppConfigs.DELAY_URL;
+                if (url == null || url.trim().isEmpty()) return -1L;
+                if (!url.startsWith("http://") && !url.startsWith("https://")) return -1L;
+                final String effectiveUrl = toHttpUrl(url);
 
                 long result;
-                // Prefer a standalone measurement to avoid interfering with running core
                 try {
-                    JSONObject config_json = new JSONObject(AppConfigs.V2RAY_CONFIG.V2RAY_FULL_JSON_CONFIG);
-                    if (config_json.has("routing")) {
-                        JSONObject routing_json = config_json.getJSONObject("routing");
-                        if (routing_json != null) {
-                            JSONObject new_routing_json = new JSONObject();
-                            Iterator<String> keys = routing_json.keys();
-                            while (keys.hasNext()) {
-                                String key = keys.next();
-                                if (!"rules".equals(key)) {
-                                    new_routing_json.put(key, routing_json.get(key));
-                                }
+                    JSONObject cfg = new JSONObject(AppConfigs.V2RAY_CONFIG.V2RAY_FULL_JSON_CONFIG);
+                    if (cfg.has("routing")) {
+                        JSONObject r = cfg.optJSONObject("routing");
+                        if (r != null) {
+                            JSONObject nr = new JSONObject();
+                            Iterator<String> it = r.keys();
+                            while (it.hasNext()) {
+                                String k = it.next();
+                                if (!"rules".equals(k)) nr.put(k, r.get(k));
                             }
-                            config_json.put("routing", new_routing_json);
+                            cfg.put("routing", nr);
                         }
                     }
-                    result = Libv2ray.measureOutboundDelay(config_json.toString(), AppConfigs.DELAY_URL);
-                    Log.d("getConnectedV2rayServerDelay", "Delay measured (standalone): " + result + "ms");
-                    consecutiveDelayErrors = 0;
-                    lastDelayCallAt = now;
-                } catch (Exception json_error) {
-                    Log.w("getConnectedV2rayServerDelay", "JSON processing failed, using fallback: " + json_error.getMessage());
-                    try {
-                        result = Libv2ray.measureOutboundDelay(AppConfigs.V2RAY_CONFIG.V2RAY_FULL_JSON_CONFIG, AppConfigs.DELAY_URL);
-                        Log.d("getConnectedV2rayServerDelay", "Delay measured with fallback (standalone): " + result + "ms");
-                        consecutiveDelayErrors = 0;
-                        lastDelayCallAt = now;
-                    } catch (Exception fallback_error) {
-                        // Try HTTPS->HTTP fallback on TLS errors
-                        String msg = String.valueOf(fallback_error.getMessage());
-                        boolean isTlsErr = msg.toLowerCase().contains("tls") || msg.toLowerCase().contains("handshake") || msg.toLowerCase().contains("x509");
-                        String url = AppConfigs.DELAY_URL;
-                        if (isTlsErr && url.startsWith("https://")) {
-                            String httpUrl = "http://" + url.substring("https://".length());
-                            try {
-                                result = Libv2ray.measureOutboundDelay(AppConfigs.V2RAY_CONFIG.V2RAY_FULL_JSON_CONFIG, httpUrl);
-                                Log.d("getConnectedV2rayServerDelay", "Delay measured with HTTP fallback (standalone): " + result + "ms");
-                                consecutiveDelayErrors = 0;
-                                lastDelayCallAt = now;
-                            } catch (Exception httpFallbackError) {
-                                Log.e("getConnectedV2rayServerDelay", "HTTP fallback also failed: " + httpFallbackError.getMessage(), httpFallbackError);
-                                consecutiveDelayErrors++;
-                                lastDelayCallAt = now;
-                                delayCooldownUntil = now + ERROR_COOLDOWN_MS;
-                                return -1L;
-                            }
-                        } else {
-                            Log.e("getConnectedV2rayServerDelay", "Standalone measurement failed: " + fallback_error.getMessage(), fallback_error);
-                            consecutiveDelayErrors++;
-                            lastDelayCallAt = now;
-                            delayCooldownUntil = now + ERROR_COOLDOWN_MS;
-                            return -1L;
-                        }
-                    }
-
-                    // Validate result (max 30 seconds = 30000ms)
-                    if (result < 0 || result > 30000) {
-                        Log.w("getConnectedV2rayServerDelay", "Invalid delay result: " + result + "ms");
-                        return -1L;
-                    }
-
-                    long realPing = result / 4; // Normalize value
-                    Log.d("getConnectedV2rayServerDelay", "Delay measured successfully: " + result + "ms, real ping: " + realPing + "ms");
-                    return realPing;
+                    result = Libv2ray.measureOutboundDelay(cfg.toString(), effectiveUrl);
+                } catch (Exception ex) {
+                    result = Libv2ray.measureOutboundDelay(AppConfigs.V2RAY_CONFIG.V2RAY_FULL_JSON_CONFIG, effectiveUrl);
                 }
-            } catch (Exception e) {
-                Log.e("getConnectedV2rayServerDelay", "Failed to measure delay: " + e.getMessage(), e);
-                return -1L;
-            } catch (Throwable t) {
-                Log.e("getConnectedV2rayServerDelay", "Critical error measuring delay: " + t.getMessage(), t);
-                return -1L;
+
+                consecutiveDelayErrors = 0;
+                errorWindowCount = 0;
+                lastDelayCallAt = now;
+
+                if (result < 0 || result > 30000) return -1L;
+                return result / 4;
             }
+        } catch (Throwable t) {
+            long now = SystemClock.elapsedRealtime();
+            lastDelayCallAt = now;
+            delayCooldownUntil = now + ERROR_COOLDOWN_MS;
+            consecutiveDelayErrors++;
+            return -1L;
+        }
     }
 
     public Long getV2rayServerDelay(final String config, final String url) {
         try {
             synchronized (delayLock) {
                 final long now = SystemClock.elapsedRealtime();
-                if (now - lastDelayCallAt < MIN_DELAY_INTERVAL_MS) {
-                    return -1L; // throttle
-                }
-                if (now < delayCooldownUntil) {
-                    return -1L; // in cooldown
-                }
+                if (now - lastDelayCallAt < MIN_DELAY_INTERVAL_MS) return -1L;
+                if (now < delayCooldownUntil) return -1L;
+                if (now < circuitBreakerUntil) return -1L;
 
-                // Input parameter validation
-                if (config == null || config.trim().isEmpty()) {
-                    Log.w("getV2rayServerDelay", "Invalid config parameter: null or empty");
-                    return -1L;
-                }
-
-                if (url == null || url.trim().isEmpty()) {
-                    Log.w("getV2rayServerDelay", "Invalid URL parameter: null or empty");
-                    return -1L;
-                }
-
-                // Validate URL format
-                if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                    Log.w("getV2rayServerDelay", "Invalid URL format: " + url);
-                    return -1L;
-                }
+                if (config == null || config.trim().isEmpty()) return -1L;
+                if (url == null || url.trim().isEmpty()) return -1L;
+                if (!url.startsWith("http://") && !url.startsWith("https://")) return -1L;
+                final String effectiveUrl = toHttpUrl(url);
 
                 long result;
-                // Try with JSON processing first (remove rules under routing for stability)
                 try {
-                    JSONObject config_json = new JSONObject(config);
-                    if (config_json.has("routing")) {
-                        JSONObject routing_json = config_json.getJSONObject("routing");
-                        if (routing_json != null) {
-                            JSONObject new_routing_json = new JSONObject();
-                            Iterator<String> keys = routing_json.keys();
-                            while (keys.hasNext()) {
-                                String key = keys.next();
-                                if (!"rules".equals(key)) {
-                                    new_routing_json.put(key, routing_json.get(key));
-                                }
+                    JSONObject cfg = new JSONObject(config);
+                    if (cfg.has("routing")) {
+                        JSONObject r = cfg.optJSONObject("routing");
+                        if (r != null) {
+                            JSONObject nr = new JSONObject();
+                            Iterator<String> it = r.keys();
+                            while (it.hasNext()) {
+                                String k = it.next();
+                                if (!"rules".equals(k)) nr.put(k, r.get(k));
                             }
-                            config_json.put("routing", new_routing_json);
+                            cfg.put("routing", nr);
                         }
                     }
-                    result = Libv2ray.measureOutboundDelay(config_json.toString(), url);
-                    Log.d("getV2rayServerDelay", "Delay measured with JSON processing: " + result + "ms");
-                    consecutiveDelayErrors = 0;
-                    lastDelayCallAt = now;
-                } catch (Exception json_error) {
-                    Log.w("getV2rayServerDelay", "JSON processing failed, using fallback: " + json_error.getMessage());
-                    try {
-                        result = Libv2ray.measureOutboundDelay(config, url);
-                        Log.d("getV2rayServerDelay", "Delay measured with fallback: " + result + "ms");
-                        consecutiveDelayErrors = 0;
-                        lastDelayCallAt = now;
-                    } catch (Exception fallback_error) {
-                        // Try HTTPS->HTTP fallback on TLS errors
-                        String msg = String.valueOf(fallback_error.getMessage());
-                        boolean isTlsErr = msg.toLowerCase().contains("tls") || msg.toLowerCase().contains("handshake") || msg.toLowerCase().contains("x509");
-                        if (isTlsErr && url.startsWith("https://")) {
-                            String httpUrl = "http://" + url.substring("https://".length());
-                            try {
-                                result = Libv2ray.measureOutboundDelay(config, httpUrl);
-                                Log.d("getV2rayServerDelay", "Delay measured with HTTP fallback: " + result + "ms");
-                                consecutiveDelayErrors = 0;
-                                lastDelayCallAt = now;
-                            } catch (Exception httpFallbackError) {
-                                Log.e("getV2rayServerDelay", "HTTP fallback also failed: " + httpFallbackError.getMessage(), httpFallbackError);
-                                consecutiveDelayErrors++;
-                                lastDelayCallAt = now;
-                                delayCooldownUntil = now + ERROR_COOLDOWN_MS;
-                                return -1L;
-                            }
-                        } else {
-                            Log.e("getV2rayServerDelay", "Fallback also failed: " + fallback_error.getMessage(), fallback_error);
-                            consecutiveDelayErrors++;
-                            lastDelayCallAt = now;
-                            delayCooldownUntil = now + ERROR_COOLDOWN_MS;
-                            return -1L;
-                        }
-                    }
+                    result = Libv2ray.measureOutboundDelay(cfg.toString(), effectiveUrl);
+                } catch (Exception ex) {
+                    result = Libv2ray.measureOutboundDelay(config, effectiveUrl);
                 }
 
-                // Validate result (max 30 seconds = 30000ms)
-                if (result < 0 || result > 30000) {
-                    Log.w("getV2rayServerDelay", "Invalid delay result: " + result + "ms");
-                    return -1L;
-                }
+                consecutiveDelayErrors = 0;
+                errorWindowCount = 0;
+                lastDelayCallAt = now;
 
-                long realPing = result / 4; // Normalize value
-                Log.d("getV2rayServerDelay", "Server delay measured: " + result + "ms, real ping: " + realPing + "ms");
-                return realPing;
+                if (result < 0 || result > 30000) return -1L;
+                return result / 4;
             }
-        } catch (Exception e) {
-            Log.e("getV2rayServerDelay", "Failed to measure server delay: " + e.getMessage(), e);
-            return -1L;
         } catch (Throwable t) {
-            Log.e("getV2rayServerDelay", "Critical error measuring server delay: " + t.getMessage(), t);
             return -1L;
+        }
+    }
+
+    private static String toHttpUrl(String url) {
+        try {
+            if (url == null) return "http://clients3.google.com/generate_204";
+            String u = url.trim();
+            if (u.isEmpty()) return "http://clients3.google.com/generate_204";
+            if (u.startsWith("https://")) return "http://" + u.substring("https://".length());
+            if (u.startsWith("http://")) return u;
+            return "http://" + u;
+        } catch (Exception ignored) {
+            return "http://clients3.google.com/generate_204";
         }
     }
 }

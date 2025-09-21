@@ -10,6 +10,7 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.net.VpnService;
 import android.os.Build;
+import android.os.SystemClock;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -43,6 +44,8 @@ public class FlutterV2rayPlugin implements FlutterPlugin, ActivityAware, PluginR
     private Activity activity;
     private BroadcastReceiver v2rayBroadCastReceiver;
     private MethodChannel.Result pendingResult;
+    private volatile long lastDelayCallAtMs = 0L;
+    private static final String DEFAULT_DELAY_URL = "http://clients3.google.com/generate_204";
 
     @SuppressLint("DiscouragedApi")
     @Override
@@ -103,7 +106,9 @@ public class FlutterV2rayPlugin implements FlutterPlugin, ActivityAware, PluginR
                 case "getServerDelay":
                     executor.submit(() -> {
                         try {
-                            result.success(V2rayController.getV2rayServerDelay(call.argument("config"), call.argument("url")));
+                            String safeUrl = coerceHttpUrl(call.argument("url"));
+                            throttleDelayCalls();
+                            result.success(V2rayController.getV2rayServerDelay(call.argument("config"), safeUrl));
                         } catch (Exception e) {
                             result.success(-1);
                         }
@@ -112,7 +117,8 @@ public class FlutterV2rayPlugin implements FlutterPlugin, ActivityAware, PluginR
                 case "getConnectedServerDelay":
                     executor.submit(() -> {
                         try {
-                            AppConfigs.DELAY_URL = call.argument("url");
+                            AppConfigs.DELAY_URL = coerceHttpUrl(call.argument("url"));
+                            throttleDelayCalls();
                             result.success(V2rayController.getConnectedV2rayServerDelay(binding.getApplicationContext()));
                         } catch (Exception e) {
                             result.success(-1);
@@ -140,6 +146,32 @@ public class FlutterV2rayPlugin implements FlutterPlugin, ActivityAware, PluginR
                     break;
             }
         });
+    }
+
+    private void throttleDelayCalls() {
+        long now = SystemClock.elapsedRealtime();
+        long minInterval = 60L; // ms
+        long gap = now - lastDelayCallAtMs;
+        if (gap < minInterval) {
+            SystemClock.sleep(minInterval - gap);
+        }
+        lastDelayCallAtMs = SystemClock.elapsedRealtime();
+    }
+
+    private static String coerceHttpUrl(Object urlArg) {
+        try {
+            String url = urlArg == null ? null : String.valueOf(urlArg);
+            if (url == null || url.trim().isEmpty()) return DEFAULT_DELAY_URL;
+            url = url.trim();
+            if (url.startsWith("https://")) {
+                return "http://" + url.substring("https://".length());
+            }
+            if (url.startsWith("http://")) return url;
+            // If scheme missing, default to http
+            return "http://" + url;
+        } catch (Exception ignored) {
+            return DEFAULT_DELAY_URL;
+        }
     }
 
 
